@@ -9,8 +9,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .merch_service import MerchService
 from .service import DomainService
 from .storage import Database
+
+
+def merch_for(service: DomainService) -> MerchService:
+    return MerchService(service.database, service.clock)
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -48,11 +53,113 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        merch_status, merch_payload = merch_route(
+            merch_for(service), method, parsed.path, body, headers, parse_qs(parsed.query))
+        if merch_status is not None:
+            return merch_status, merch_payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+MERCH_POST_ROUTES = {
+    "/partners": ("registry", "register_partner"),
+    "/partner-qualifications": ("registry", "review_qualification"),
+    "/partner-representatives": ("registry", "bind_representative"),
+    "/teams": ("registry", "register_team"),
+    "/team-members": ("registry", "add_team_member"),
+    "/signing-grants": ("registry", "grant_signing"),
+    "/signing-grants/revoke": ("registry", "revoke_signing"),
+    "/works": ("registry", "register_work"),
+    "/design-versions": ("registry", "add_design_version"),
+    "/design-versions/countersign": ("registry", "countersign_version"),
+    "/design-versions/prerequisite": ("registry", "complete_version_prerequisite"),
+    "/cost-sheets": ("registry", "register_cost_sheet"),
+    "/share-sheets": ("registry", "register_share_sheet"),
+    "/intentions": ("negotiation", "create_intention"),
+    "/intentions/terminate": ("negotiation", "terminate_intention"),
+    "/offers": ("negotiation", "make_offer"),
+    "/offers/withdraw": ("negotiation", "withdraw_offer"),
+    "/offers/expire": ("negotiation", "expire_stale_offers"),
+    "/offers/reserve": ("negotiation", "reserve_offer"),
+    "/offers/reservation/release": ("negotiation", "release_reservation"),
+    "/offers/sign": ("negotiation", "sign_offer"),
+    "/offers/accept": ("negotiation", "accept_offer"),
+    "/samples": ("performance", "confirm_sample"),
+    "/milestones/approve": ("performance", "approve_milestone"),
+    "/deliveries": ("performance", "record_delivery"),
+    "/change-orders": ("performance", "propose_change_order"),
+    "/change-orders/sign": ("performance", "sign_change_order"),
+    "/change-orders/approve": ("performance", "approve_change_order"),
+    "/change-orders/reject": ("performance", "reject_change_order"),
+    "/breaches": ("performance", "report_breach"),
+    "/breaches/remediation": ("performance", "submit_remediation"),
+    "/breaches/resolve": ("performance", "resolve_breach"),
+    "/contracts/terminate": ("performance", "terminate_contract"),
+    "/settlements": ("performance", "generate_settlement"),
+    "/settlements/dispute": ("performance", "dispute_settlement"),
+    "/settlements/disputes/resolve": ("performance", "resolve_dispute"),
+}
+
+
+def _one(query: dict[str, str], key: str, default: str | None = None) -> str | None:
+    return query.get(key, [default])[0]
+
+
+def merch_route(merch: MerchService, method: str, path: str, body: dict[str, Any],
+                headers: dict[str, str], query) -> tuple[int | None, dict[str, Any] | None]:
+    """分派商品化合作管理接口；未命中返回 (None, None)。"""
+
+    actor_id = headers.get("X-Actor-Id", "")
+    segments = [segment for segment in path.split("/") if segment]
+    if method == "POST" and path in MERCH_POST_ROUTES:
+        if path == "/deliveries" and "quantity" in body:
+            quantity_value = body["quantity"]
+            body = {key: value for key, value in body.items() if key != "quantity"}
+            body["quantity_value"] = quantity_value
+        group_name, method_name = MERCH_POST_ROUTES[path]
+        group = getattr(merch, group_name)
+        receipt = getattr(group, method_name)(actor_id=actor_id, **body)
+        return 200 if receipt.replayed else 201, receipt.__dict__
+    if method != "GET":
+        return None, None
+    if path == "/offers":
+        return 200, {"items": merch.list_offers(
+            actor_id=actor_id, work_id=_one(query, "work_id"),
+            thread_id=_one(query, "thread_id"), status=_one(query, "status"))}
+    if path == "/contracts":
+        return 200, {"items": merch.list_contracts(
+            actor_id=actor_id, work_id=_one(query, "work_id"),
+            status=_one(query, "status"))}
+    if len(segments) == 3 and segments[0] == "works" and segments[2] == "occupancy":
+        merch.authorize_work_occupancy(actor_id, segments[1])
+        return 200, merch.negotiation.rights_occupancy(
+            segments[1], as_of=_one(query, "as_of"))
+    if len(segments) == 3 and segments[0] == "design-versions" and segments[2] == "readiness":
+        merch.authorize_version_readiness(actor_id, segments[1])
+        return 200, merch.registry.get_version_readiness(segments[1])
+    if len(segments) == 2 and segments[0] == "offers":
+        return 200, merch.offer_view(actor_id, segments[1])
+    if len(segments) == 2 and segments[0] == "contracts":
+        return 200, merch.contract_view(actor_id, segments[1])
+    if len(segments) == 3 and segments[0] == "contracts":
+        contract_id = segments[1]
+        merch.authorize_contract(actor_id, contract_id)
+        if segments[2] == "facts":
+            after = int(_one(query, "after_sequence", "0") or "0")
+            return 200, {"items": merch.performance.list_facts(contract_id, after)}
+        if segments[2] == "deliveries":
+            return 200, {"items": merch.performance.list_deliveries(contract_id)}
+        if segments[2] == "settlements":
+            return 200, {"items": merch.performance.list_settlements(contract_id)}
+    if len(segments) == 2 and segments[0] == "settlements":
+        return 200, merch.settlement_view(actor_id, segments[1])
+    if len(segments) == 3 and segments[0] == "settlements" and segments[2] == "explain":
+        merch.authorize_settlement_explain(actor_id, segments[1])
+        return 200, merch.explain_settlement(segments[1])
+    return None, None
 
 
 class Handler(BaseHTTPRequestHandler):
